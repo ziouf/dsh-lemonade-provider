@@ -1,45 +1,45 @@
 # dsh-lemonade-provider
 
-Plugin **dsh** qui intègre [Lemonade Server](https://lemonade-server.ai) comme
-fournisseur de modèles du DeepSeek Harness.
+A **dsh** plugin that integrates [Lemonade Server](https://lemonade-server.ai) as
+a model provider for DeepSeek Harness.
 
-Lemonade expose une API compatible OpenAI (Chat Completions). Ce plugin branche
-cette API sur le service `ctx.llm` du Harness sous la route provider
-**`lemonade`** :
+Lemonade exposes an OpenAI-compatible API (Chat Completions). This plugin wires
+this API to the Harness's `ctx.llm` service under the **`lemonade`** provider
+route:
 
-- **Chat Completions** en streaming (SSE) via `POST {baseURL}/chat/completions`
-- **Découverte de modèles** live depuis `GET {baseURL}/models`
-- **Clé API optionnelle** (`LEMONADE_API_KEY`) — utile seulement quand le
-  serveur est configuré avec authentification
-- Support **vision** : les blocs image du Harness sont envoyés en `image_url`
-  (data URL) aux modèles `vision`
-- **Tool calling** au format OpenAI standard
+- **Chat Completions** streaming (SSE) via `POST {baseURL}/chat/completions`
+- **Model discovery** live from `GET {baseURL}/models`
+- **Optional API key** (`LEMONADE_API_KEY`) — only needed when
+  the server is configured with authentication
+- **Vision support**: Harness image blocks are sent as `image_url`
+  (data URL) to `vision` models
+- **Tool calling** in standard OpenAI format
 
-## Prérequis
+## Prerequisites
 
-- Un Lemonade Server en cours d'exécution (par défaut `http://localhost:13305`)
+- A running Lemonade Server (default `http://localhost:13305`)
 - Node.js ≥ 22
-- Une installation dsh (profil), par ex. le profil `web`
+- A dsh installation (profile), e.g. the `web` profile
 
-> Le paquet doit être **compilé au préalable** : `pnpm install && pnpm build`
-> (volet « Développement » ci-dessous) — dsh charge le code depuis `lib/`.
+> The package must be **built beforehand**: `pnpm install && pnpm build`
+> ("Development" section below) — dsh loads code from `lib/`.
 
-## Installation dans un profil
+## Installation in a profile
 
-Depuis le répertoire du profil (ex. `~/.dsh/profiles/web`) :
+From the profile directory (e.g. `~/.dsh/profiles/web`):
 
 ```sh
 pnpm add file:../dsh-lemonade-provider
 ```
 
-ou, en ligne de commande dsh :
+Or, via the dsh command line:
 
 ```sh
 dsh plugin --profile web add file:../dsh-lemonade-provider
 ```
 
-Ajoutez ensuite une entrée dans `cordis.patch.yml` du profil (voir
-[exemple/cordis.patch.yml](example/cordis.patch.yml)) :
+Then add an entry to the profile's `cordis.patch.yml` (see
+[example/cordis.patch.yml](example/cordis.patch.yml)):
 
 ```yaml
 - id: llm-lemonade
@@ -48,81 +48,84 @@ Ajoutez ensuite une entrée dans `cordis.patch.yml` du profil (voir
     baseURL: http://localhost:13305
 ```
 
-> `baseURL` est la racine du serveur (un suffixe `/v1` d'anciennes configs est
-> `LEMONADE_BASE_URL` est définie, elle est utilisée quand `baseURL` est omis.
+> `baseURL` is the server root (an old `/v1` suffix from legacy configs is also
+> supported). If `LEMONADE_BASE_URL` is set, it is used when `baseURL` is omitted.
 
 ## Configuration
 
-| Champ | Type | Défaut | Description |
+| Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `baseURL` | string | `http://localhost:13305` (ou `LEMONADE_BASE_URL`) | Normalisée à `scheme://host/api` — `/api` ajouté si manquant, `/v1/…` ajouté par endpoint |
-| `apiKeyEnv` | string (credential-ref) | `LEMONADE_API_KEY` | Clé régulière (endpoints /v1/*) |
-| `adminApiKeyEnv` | string (credential-ref) | `LEMONADE_ADMIN_API_KEY` | Clé admin optionnelle (endpoints internes /internal/* et /metrics) |
-| `requireAuth` | boolean | `false` | Échouer quand la clé est absente (distant protégé) |
-| `models` | array | `[]` | Catalogue advisory épinglé par l'utilisateur |
-| `defaultContextWindow` | number | `32768` | Fenêtre de contexte utilisée quand le serveur n'en déclare pas |
-| `maxTokens` | number | `8192` | Cap de sortie par défaut |
-| `streamIdleTimeoutMs` | number | `300000` | Timeout d'inactivité du flux SSE |
-| `retryPolicy` | object | defaults normaux | Politique de retry du provider |
+| `baseURL` | string | `http://localhost:13305` (or `LEMONADE_BASE_URL`) | Normalized to `scheme://host/api` — `/api` appended if missing, `/v1/…` appended per endpoint |
+| `apiKeyEnv` | string (credential-ref) | `LEMONADE_API_KEY` | Regular API key (for /v1/* endpoints) |
+| `adminApiKeyEnv` | string (credential-ref) | `LEMONADE_ADMIN_API_KEY` | Optional admin API key (for internal /internal/* and /metrics endpoints) |
+| `requireAuth` | boolean | `false` | Fail when the key is absent (protected remote) |
+| `models` | array | `[]` | User-pinned advisory model catalog |
+| `defaultContextWindow` | number | `32768` | Context window used when the server doesn't declare one |
+| `maxTokens` | number | `8192` | Default output cap |
+| `streamIdleTimeoutMs` | number | `300000` | SSE stream idle timeout |
+| `retryPolicy` | object | default values | Provider retry policy |
 
-Chaque champ de `models` : `id` (obligatoire), `name`, `description`,
+Each entry in `models`: `id` (required), `name`, `description`,
 `contextWindow`, `maxTokens`, `vision` (boolean).
 
-## Découverte des modèles
+## Model Discovery
 
-La page Modèles du Harness peut interroger `GET {baseURL}/models` via la
-discovery enregistrée pour l'espace de réglages `llm-lemonade`. Les modèles
-non-téléchargés et ceux routés vers d'autres endpoints (embeddings, image,
-TTS, transcription, …) sont exclus de la liste proposée ; la fenêtre de
-contexte déclarée (`max_context_window`) est reprise quand elle est présente.
+The Harness Models page can query `GET {baseURL}/models` through the
+discovery registered for the `llm-lemonade` settings namespace. Undownloaded
+models and those routed to other endpoints (embeddings, image,
+TTS, transcription, …) are excluded from the proposed list; the declared
+context window (`max_context_window`) is reused when present.
 
-## Configuration UI (Settings → Models)
+## UI Configuration (Settings → Models)
 
-La page Settings/Models de dsh n'a pas de porte de sortie tierce : son éditeur ne
-connaît que les namespaces `llm-deepseek` et `llm-pi-ai`. Le plugin branche donc
-sa carte d'édition sur la carte `pi-ai` de la page Models via un patch ponctuel
-du bundle vendu `dsh-client-ui-settings-models` (route `llm-lemonade` → famille
-`pi-ai`). Après toute réinstallation du cache npm (`npm exec`), relancer :
+The dsh Settings/Models page has no third-party exit gate: its editor only
+knows the `llm-deepseek` and `llm-pi-ai` namespaces. The plugin therefore wires
+its edit card to the `pi-ai` card on the Models page through a targeted patch
+of the bundled `dsh-client-ui-settings-models` bundle (`llm-lemonade` route →
+`pi-ai` family). After any npm cache reinstallation (`npm exec`), rerun:
 
 ```sh
 node scripts/patch-models-ui.mjs
 node scripts/patch-models-ui-admin.mjs
 ```
 
-Le formulaire (Settings → Models -> ligne Lemonade) permet de saisir la clé API
-(optionnelle, stockée via le service credentials sous `LEMONADE_API_KEY`),
-la **clé admin optionnelle** (`LEMONADE_ADMIN_API_KEY` — endpoints internes
-`/internal/*` et `/metrics`, via le patch `patch-models-ui-admin.mjs`),
-la base URL (repli « customized »), et de sélectionner les modèles servis par
-Lemonade via « Fetch available models » (découverte `llm.discoverModels`).
+The form (Settings → Models -> Lemonade row) allows entering the API key
+(optional, stored via the credentials service under `LEMONADE_API_KEY`),
+the **optional admin key** (`LEMONADE_ADMIN_API_KEY` — internal endpoints
+`/internal/*` and `/metrics`, via the `patch-models-ui-admin.mjs` patch),
+the base URL (falling back to "customized"), and selecting models served by
+Lemonade via "Fetch available models" (`llm.discoverModels`).
 
-## Vue « Lemonade » (onglet de la conversation)
+## Lemonade View (Conversation Tab)
 
-Un onglet **Lemonade** (à côté de Chat/Trajectory) expose les points d'entrée de
-l'API spécifique Lemonade (health/liveness, télémétrie, modèles avec
-Load/Unload/Delete/Fichiers/MAJ, téléchargements contrôlables, et clés cloud).
-Le navigateur appelle le serveur dsh en même origine (`/dsh-lemonade/api/<op>`) ;
-le host proxi vers Lemonade (`src/server-api.ts`) en résolvant baseURL + clé
-(celles-ci ne quittent jamais le host). La sélection de la clé est **par endpoint** : les endpoints réguliers (/v1/*, /live) s'authentifient avec `LEMONADE_API_KEY`, et les endpoints de contrôle (`/internal/*`, `/metrics`) avec `LEMONADE_ADMIN_API_KEY` (avec repli sur la clé régulière). La route est enregistrée via
+A **Lemonade** tab (next to Chat/Trajectory) exposes the entry points of the
+Lemonade-specific API (health/liveness, telemetry, models with
+Load/Unload/Delete/Files/Update, controllable downloads, and cloud keys).
+The browser calls the dsh server on the same origin (`/dsh-lemonade/api/<op>`);
+the host proxy to Lemonade (`src/server-api.ts`) resolves baseURL + key
+(these never leave the host). Key selection is **per endpoint**: regular
+endpoints (/v1/*, /live) authenticate with `LEMONADE_API_KEY`, and control
+endpoints (`/internal/*`, `/metrics`) with `LEMONADE_ADMIN_API_KEY` (falling
+back to the regular key). The route is registered via
 `ctx.webServer.register({ kind: 'prefix', path: '/dsh-lemonade/api', ... })`
-quand le service `webServer` est disponible.
+when the `webServer` service is available.
 
-## Développement
+## Development
 
 ```sh
 pnpm install
-pnpm build      # compile TypeScript vers lib/
-pnpm test       # tests du protocole (serveur SSE simulé)
+pnpm build      # compile TypeScript to lib/
+pnpm test       # protocol tests (simulated SSE server)
 ```
 
 ### Structure
 
-- `src/index.ts` — plugin : schéma de config, `apply`, découverte, credentials
+- `src/index.ts` — plugin: config schema, `apply`, discovery, credentials
 - `src/adapter.ts` — `LemonadeAdapter extends LlmAdapter` (fetch + SSE)
-- `src/serialize.ts` — messages Harness → wire OpenAI
-- `src/translate.ts` — SSE payloads → chunks `StreamChunk`
-- `test/adapter.test.mjs` — suite de tests sans dépendance (mock HTTP)
+- `src/serialize.ts` — Harness messages → OpenAI wire format
+- `src/translate.ts` — SSE payloads → `StreamChunk` chunks
+- `test/adapter.test.mjs` — dependency-free test suite (mock HTTP)
 
-### Licence
+### License
 
 MIT
