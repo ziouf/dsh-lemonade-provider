@@ -1,0 +1,12 @@
+# Exemple d'entrée de patch pour le profil.
+# À fusionner dans le cordis.patch.yml du profil (ex. ~/.dsh/profiles/web/cordis.patch.yml).
+# Le paquet doit être installé dans le node_modules du profil (voir README.md).
+- id: llm-lemonade
+  name: 'dsh-lemonade-provider'
+  config:
+    baseURL: http://localhost:13305/v1
+    # requireAuth: true        # décommentez si le serveur exige une clé
+    # apiKeyEnv: LEMONADE_API_KEY
+    # retryPolicy:
+    #   mode: normal
+    #   maxRetries: 2
