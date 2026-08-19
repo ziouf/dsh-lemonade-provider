@@ -184,16 +184,31 @@ export function resolveAdapterOptions(
   };
 }
 
-/** Resolve the optional bearer token, enforcing `requireAuth` when configured. */
+/**
+ * Resolve one credential reference through the credentials seam, falling back
+ * to the launch environment. Never returns a blank value; `undefined` when the
+ * key is unconfigured. Shared by the adapter bearer-token resolver (which may
+ * additionally enforce `requireAuth`) and by the host proxy key resolver.
+ */
+async function resolveCredential(ctx: Context, ref: CredentialRef): Promise<string | undefined> {
+  let value: string | undefined;
+  const credentials = ctx.get('credentials');
+  if (credentials !== undefined) value = (await credentials.resolve(ref))?.value;
+  if (value === undefined) value = launchEnvironmentOf(ctx).get(ref)?.value;
+  if (value === undefined || value.length === 0) return undefined;
+  return assertUsableApiKey(value, 'llm-lemonade', String(ref));
+}
+
+/**
+ * Resolve the optional bearer token, enforcing `requireAuth` when configured.
+ * The credentials-or-env resolution itself is delegated to resolveCredential.
+ */
 function makeResolveApiKey(ctx: Context, options: () => LemonadeOptions): () => Promise<string | undefined> {
   return async () => {
     const connection = options();
     const ref = connection.apiKeyEnv;
-    let value: string | undefined;
-    const credentials = ctx.get('credentials');
-    if (credentials !== undefined) value = (await credentials.resolve(ref))?.value;
-    if (value === undefined) value = launchEnvironmentOf(ctx).get(ref)?.value;
-    if (value === undefined || value.length === 0) {
+    const value = await resolveCredential(ctx, ref);
+    if (value === undefined) {
       if (connection.requireAuth) {
         throw new LlmError(
           `llm-lemonade: no API key for provider route "${PROVIDER}"; store ${String(ref)} through the credentials service (the web Models page writes it), or export ${String(ref)} in the launching environment`,
@@ -202,7 +217,7 @@ function makeResolveApiKey(ctx: Context, options: () => LemonadeOptions): () => 
       }
       return undefined;
     }
-    return assertUsableApiKey(value, 'llm-lemonade', String(ref));
+    return value;
   };
 }
 
@@ -275,14 +290,7 @@ export function apply(ctx: Context, config: LemonadeRawConfig): void {
   // Lemonade-specific API proxy: browser client half calls these routes
   // same-origin; the keys are resolved host-side and never reach the browser.
   // Per-endpoint key selection (regular vs admin) lives in server-api.ts.
-  const resolveKey = async (ref: CredentialRef): Promise<string | undefined> => {
-    let value: string | undefined;
-    const credentials = ctx.get('credentials');
-    if (credentials !== undefined) value = (await credentials.resolve(ref))?.value;
-    if (value === undefined) value = launchEnvironmentOf(ctx).get(ref)?.value;
-    if (value === undefined || value.length === 0) return undefined;
-    return assertUsableApiKey(value, 'llm-lemonade', String(ref));
-  };
+  const resolveKey = (ref: CredentialRef): Promise<string | undefined> => resolveCredential(ctx, ref);
   const apiCfg = {
     baseURL: () => options().baseURL,
     requireAuth: () => options().requireAuth,
