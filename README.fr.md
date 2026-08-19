@@ -43,7 +43,7 @@ Ajoutez ensuite une entrée dans `cordis.patch.yml` du profil (voir
 
 ```yaml
 - id: llm-lemonade
-  name: 'dsh-lemonade-provider'
+  name: 'llm-lemonade'
   config:
     baseURL: http://localhost:13305
 ```
@@ -108,6 +108,25 @@ le host proxi vers Lemonade (`src/server-api.ts`) en résolvant baseURL + clé
 `ctx.webServer.register({ kind: 'prefix', path: '/dsh-lemonade/api', ... })`
 quand le service `webServer` est disponible.
 
+### Bundle client navigateur
+
+La moitié navigateur vit dans `src/client/index.js` et est copiée telle quelle
+vers `lib/client.js` par le build (`scripts/copy-client.mjs`). Le bundle
+s'enregistre auprès du module loader sous le **nom du paquet** —
+`@cmarin/dsh-lemonade` — car le harness identifie les modules client des plugins
+par leur nom de paquet dans son manifeste de boot :
+
+```js
+window.__ModuleLoader__.load({ id: "@cmarin/dsh-lemonade", factory: (require) => { /* … */ } })
+```
+
+L'id d'enregistrement doit correspondre exactement à l'id de la ligne du graphe ;
+en cas de désaccord, le harness échoue avec *« loaded without registering
+`<id>` via `__ModuleLoader__.load` »*. Comme `lib/` est ignoré par git (sortie de
+build), pensez toujours à reconstruire après toute modification de
+`src/client/index.js` et à réinstaller le paquet dans le profil avant de
+recharger le GUI.
+
 ## Développement
 
 ```sh
@@ -122,6 +141,7 @@ pnpm test       # tests du protocole (serveur SSE simulé)
 - `src/adapter.ts` — `LemonadeAdapter extends LlmAdapter` (fetch + SSE)
 - `src/serialize.ts` — messages Harness → filaire OpenAI
 - `src/translate.ts` — payloads SSE → chunks `StreamChunk`
+- `src/client/index.js` — moitié navigateur (onglet Lemonade), copiée vers `lib/client.js`
 - `test/adapter.test.mjs` — suite de tests sans dépendance (mock HTTP)
 
 ### Licence

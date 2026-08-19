@@ -43,7 +43,7 @@ Then add an entry to the profile's `cordis.patch.yml` (see
 
 ```yaml
 - id: llm-lemonade
-  name: 'dsh-lemonade-provider'
+  name: 'llm-lemonade'
   config:
     baseURL: http://localhost:13305
 ```
@@ -110,6 +110,24 @@ back to the regular key). The route is registered via
 `ctx.webServer.register({ kind: 'prefix', path: '/dsh-lemonade/api', ... })`
 when the `webServer` service is available.
 
+### Client browser bundle
+
+The browser half lives in `src/client/index.js` and is copied verbatim to
+`lib/client.js` by the build (`scripts/copy-client.mjs`). The bundle registers
+itself with the module loader under the **package name** — `@cmarin/dsh-lemonade`
+— because the harness keys plugin client modules by package name in its boot
+manifest:
+
+```js
+window.__ModuleLoader__.load({ id: "@cmarin/dsh-lemonade", factory: (require) => { /* … */ } })
+```
+
+The registration id must match the graph row id exactly; a mismatch makes the
+harness fail with *"loaded without registering `<id>` via `__ModuleLoader__.load`"*.
+Because `lib/` is gitignored (build output), always rebuild after touching
+`src/client/index.js` and reinstall the package in the profile before reloading
+the GUI.
+
 ## Development
 
 ```sh
@@ -124,6 +142,7 @@ pnpm test       # protocol tests (simulated SSE server)
 - `src/adapter.ts` — `LemonadeAdapter extends LlmAdapter` (fetch + SSE)
 - `src/serialize.ts` — Harness messages → OpenAI wire format
 - `src/translate.ts` — SSE payloads → `StreamChunk` chunks
+- `src/client/index.js` — browser half (Lemonade conversation tab), copied to `lib/client.js`
 - `test/adapter.test.mjs` — dependency-free test suite (mock HTTP)
 
 ### License
