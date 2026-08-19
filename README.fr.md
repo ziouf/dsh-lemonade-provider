@@ -32,6 +32,12 @@ Depuis le répertoire du profil (ex. `~/.dsh/profiles/web`) :
 pnpm add file:../dsh-lemonade-provider
 ```
 
+ou depuis npm (le paquet publié est `@cyrilmarin/dsh-lemonade`) :
+
+```sh
+pnpm add @cyrilmarin/dsh-lemonade@latest
+```
+
 ou, en ligne de commande dsh :
 
 ```sh
