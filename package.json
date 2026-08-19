@@ -1,7 +1,7 @@
 {
   "name": "@cyrilmarin/dsh-lemonade",
   "description": "Lemonade Server (OpenAI-compatible) LLM provider plugin for the DeepSeek Harness",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
