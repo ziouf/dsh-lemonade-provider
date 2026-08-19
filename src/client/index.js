@@ -282,9 +282,22 @@ window.__ModuleLoader__.load({
 
 			const loadedByModel = (id) => (health && Array.isArray(health.all_models_loaded) ? health.all_models_loaded : []).find((m) => m.model_name === id);
 
-			// The tab lists EVERY model the server advertises, optionally filtered
+			// The tab lists every model the server advertises, optionally filtered
 			// to downloaded ones (checkbox in the block header, checked by default).
-			const visibleModels = (Array.isArray(models) ? models : []).filter((m) => !onlyDownloaded || m.downloaded !== false);
+			// Aliases are hidden: an alias is an entry whose name is in the alias
+			// listing (GET /internal/aliases) or that carries a "model" field
+			// pointing at its target (a real downloaded model never does).
+			const aliasNames = new Set(
+				(Array.isArray(aliases) ? aliases : [])
+					.map((a) => (a ? (a.alias !== undefined ? a.alias : a.name) : undefined))
+					.filter((v) => typeof v === "string" && v.length > 0),
+			);
+			const visibleModels = (Array.isArray(models) ? models : []).filter((m) => {
+				if (m === null || typeof m !== "object") return false;
+				if (typeof m.model === "string" && m.model.length > 0) return false;
+				if (aliasNames.has(m.id) || aliasNames.has(m.name)) return false;
+				return !onlyDownloaded || m.downloaded !== false;
+			});
 
 			const toggleFiles = async (id) => {
 				if (filesById[id] !== undefined) {
