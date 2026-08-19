@@ -9,7 +9,7 @@
  * dictionary or add locales). Shipped in the module-loader factory format.
  */
 window.__ModuleLoader__.load({
-	id: "dsh-lemonade-provider",
+	id: "@cmarin/dsh-lemonade",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;

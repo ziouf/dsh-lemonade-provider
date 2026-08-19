@@ -24,7 +24,7 @@ let passed = 0;
 const eq = (a, b, label) => { assert.deepEqual(a, b, label); passed += 1; };
 const ok = (c, label) => { assert.ok(c, label); passed += 1; };
 
-eq(captured.id, 'dsh-lemonade-provider', 'loader id');
+eq(captured.id, '@cmarin/dsh-lemonade', 'loader id');
 ok(typeof captured.factory === 'function', 'factory function');
 
 const exp = captured.factory((name) => {

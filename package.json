@@ -1,5 +1,5 @@
 {
-  "name": "dsh-lemonade-provider",
+  "name": "@cmarin/dsh-lemonade",
   "description": "Lemonade Server (OpenAI-compatible) LLM provider plugin for the DeepSeek Harness",
   "version": "0.1.0",
   "private": true,
