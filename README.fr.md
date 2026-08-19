@@ -113,11 +113,11 @@ quand le service `webServer` est disponible.
 La moitié navigateur vit dans `src/client/index.js` et est copiée telle quelle
 vers `lib/client.js` par le build (`scripts/copy-client.mjs`). Le bundle
 s'enregistre auprès du module loader sous le **nom du paquet** —
-`@cmarin/dsh-lemonade` — car le harness identifie les modules client des plugins
+`@cyrilmarin/dsh-lemonade` — car le harness identifie les modules client des plugins
 par leur nom de paquet dans son manifeste de boot :
 
 ```js
-window.__ModuleLoader__.load({ id: "@cmarin/dsh-lemonade", factory: (require) => { /* … */ } })
+window.__ModuleLoader__.load({ id: "@cyrilmarin/dsh-lemonade", factory: (require) => { /* … */ } })
 ```
 
 L'id d'enregistrement doit correspondre exactement à l'id de la ligne du graphe ;
@@ -147,3 +147,40 @@ pnpm test       # tests du protocole (serveur SSE simulé)
 ### Licence
 
 MIT
+
+## Release
+
+L'automatisation de release est un script autonome sans dépendance tierce :
+`scripts/release.mjs`. Commandes disponibles :
+
+```sh
+pnpm release:dry      # affiche le plan (aucun fichier écrit, aucune commande git mutative)
+pnpm release          # détecte l'incrément depuis les commits conventionnels
+pnpm release:major    # force un bump major
+pnpm release:minor    # force un bump minor
+pnpm release:patch    # force un bump patch
+```
+
+Le script de release :
+
+1. Détermine l'incrément depuis les commits conventionnels entre le dernier
+   tag (ou tout l'historique s'il n'y a aucun tag) et HEAD :
+
+   | Commit | Bump |
+   | --- | --- |
+   | sujet `type(scope)!: …` ou `BREAKING CHANGE:` dans le corps | major |
+   | `feat` | minor |
+   | `fix`, `perf` | patch |
+   | tout autre commit non encore tagué | patch (fallback) |
+
+   S'il n'y a aucun commit à publier, il affiche un message et sort avec le
+   code 0 sans rien faire.
+2. Incrémente `version` dans `package.json` (un suffixe pré-release, s'il en
+   existe un, est retiré — la release est finale).
+3. Commite `chore(release): <version>` (ne stage que `package.json`).
+4. Crée le tag annoté `v<version>` (préfixe configurable via `--tag-prefix`).
+5. Pousse la branche courante et le tag vers `origin` (omis avec `--no-push`).
+
+> La publication npm proprement dite n'est pas réalisée par le script : elle
+> est déclenchée par la GitHub Release créée sur le tag poussé (workflow
+> [.github/workflows/publish.yml](.github/workflows/publish.yml)).

@@ -114,12 +114,12 @@ when the `webServer` service is available.
 
 The browser half lives in `src/client/index.js` and is copied verbatim to
 `lib/client.js` by the build (`scripts/copy-client.mjs`). The bundle registers
-itself with the module loader under the **package name** — `@cmarin/dsh-lemonade`
+itself with the module loader under the **package name** — `@cyrilmarin/dsh-lemonade`
 — because the harness keys plugin client modules by package name in its boot
 manifest:
 
 ```js
-window.__ModuleLoader__.load({ id: "@cmarin/dsh-lemonade", factory: (require) => { /* … */ } })
+window.__ModuleLoader__.load({ id: "@cyrilmarin/dsh-lemonade", factory: (require) => { /* … */ } })
 ```
 
 The registration id must match the graph row id exactly; a mismatch makes the
@@ -148,3 +148,42 @@ pnpm test       # protocol tests (simulated SSE server)
 ### License
 
 MIT
+
+## Release
+
+Release automation is a self-contained script with no third-party dependency:
+`scripts/release.mjs`. Available commands:
+
+```sh
+pnpm release:dry      # show the plan (no file writes, no mutating git commands)
+pnpm release          # auto-detect the bump from the conventional commits
+pnpm release:major    # force a major bump
+pnpm release:minor    # force a minor bump
+pnpm release:patch    # force a patch bump
+```
+
+The release script:
+
+1. Determines the increment from the conventional commits between the last
+   tag (or the full history when no tag exists) and HEAD:
+
+   | Commit | Bump |
+   | --- | --- |
+   | `type(scope)!: …` subject or `BREAKING CHANGE:` in the body | major |
+   | `feat` | minor |
+   | `fix`, `perf` | patch |
+   | any other commit not yet tagged | patch (fallback) |
+
+   With no commit to publish, it prints a message and exits 0 without doing
+   anything.
+2. Bumps `version` in `package.json` (a prerelease suffix, if present, is
+   dropped — the release is final).
+3. Commits `chore(release): <version>` (stages `package.json` only).
+4. Creates the annotated tag `v<version>` (prefix configurable via
+   `--tag-prefix`).
+5. Pushes the current branch and the tag to `origin` (omitted with
+   `--no-push`).
+
+> The npm publication itself is not performed by the script: it is triggered
+> by the GitHub Release created on the pushed tag (workflow
+> [.github/workflows/publish.yml](.github/workflows/publish.yml)).
