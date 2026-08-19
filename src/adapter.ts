@@ -168,6 +168,9 @@ export async function fetchModelEntries(
     const record = (raw ?? {}) as Record<string, unknown>;
     const id = typeof record['id'] === 'string' ? (record['id'] as string) : '';
     if (id.length === 0 || seen.has(id)) continue;
+    // Skip alias entries (Lemonade Server exposes model aliases alongside real
+    // models; an alias has a "model" field pointing to its target).
+    if (typeof record['model'] === 'string' && record['model'].length > 0) continue;
     if (record['downloaded'] === false) continue;
     const labels = Array.isArray(record['labels'])
       ? (record['labels'] as unknown[]).filter((label): label is string => typeof label === 'string')
