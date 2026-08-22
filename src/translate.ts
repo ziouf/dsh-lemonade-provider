@@ -18,17 +18,56 @@ import { CallId, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm';
 import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm';
 import { EventSourceParserStream } from 'eventsource-parser/stream';
 
+/**
+ * A `[DONE]` sentinel in the *middle* of a payload stream (i.e. not the final
+ * event) is malformed: clean consumers normally emit it only once, at EOF.
+ * This is a soft warning — the caller ignores it rather than aborting — so a
+ * briefly misbehaving server never silently kills a generation.
+ */
+export const MID_STREAM_DONE_WARNING = 'lemonade-sse: mid-stream [DONE] detected; the stream may end prematurely';
+
+/** Max consecutive malformed SSE payloads tolerated before aborting. */
+const MAX_SKIP = 20;
+
 /** Parse an SSE byte stream into its `data` payloads. */
 export async function* parseSse(
   stream: ReadableStream<Uint8Array>,
   onComment?: (comment: string) => void,
+  onSkip?: (reason: string) => void,
 ): AsyncGenerator<string> {
   const events = stream
     .pipeThrough(new TextDecoderStream())
     .pipeThrough(new EventSourceParserStream({ onComment }));
+  let consecutiveSkips = 0;
   for await (const { data } of events) {
+    // The `[DONE]` sentinel is not valid JSON, so special-case it before the
+    // JSON.parse path (which would otherwise treat it as a malformed payload
+    // and drop it). It is yielded verbatim and translate() decides, from the
+    // payloads that follow it, whether it landed mid-stream.
+    if (data === '[DONE]') {
+      yield data;
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = data.length === 0 ? {} : JSON.parse(data);
+    } catch {
+      consecutiveSkips += 1;
+      if (consecutiveSkips > MAX_SKIP) {
+        onSkip?.('malformed SSE payloads exhausted tolerance (' + consecutiveSkips + ')');
+        return;
+      }
+      onSkip?.('skipping malformed SSE payload');
+      continue;
+    }
+    consecutiveSkips = 0;
+    // A non-object payload (e.g. a bare string or number) carries no usable
+    // choices/usage; skip it rather than treating it as an empty object.
+    if (parsed === null || typeof parsed !== 'object') {
+      onSkip?.('skipping non-object SSE payload');
+      continue;
+    }
     yield data;
-    if (data === '[DONE]') return;
   }
 }
 
@@ -106,10 +145,21 @@ interface WireChunk {
 /**
  * Consume SSE data payloads (optionally ending with `[DONE]`) and yield
  * harness StreamChunks. Malformed JSON payloads abort the stream with
- * `MALFORMED_RESPONSE`. A `stop` (or absent) finish with no opened blocks is a
- * degenerate provider completion and maps to an `EMPTY_RESPONSE` error finish.
+ * `MALFORMED_RESPONSE` — parseSse already skips transiently malformed payloads
+ * with a threshold, so a payload reaching this point is genuinely corrupt. A
+ * `stop` (or absent) finish with no opened blocks is a degenerate provider
+ * completion and maps to an `EMPTY_RESPONSE` error finish.
+ *
+ * `[DONE]` is skipped (not terminal here): it flows through parseSse and is
+ * only treated as a soft warning when a *further* payload follows it — a clean
+ * terminal `[DONE]` ends the loop without warning. A mid-stream `[DONE]` (or
+ * content after the sentinel) logs a soft warning and the loop continues
+ * rather than crashing.
  */
-export async function* translate(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk> {
+export async function* translate(
+  payloads: AsyncIterable<string>,
+  onSkip?: (reason: string) => void,
+): AsyncGenerator<StreamChunk> {
   let nextIndex = 0;
   let textBlock: OpenBlock | undefined;
   let reasoningBlock: OpenBlock | undefined;
@@ -117,6 +167,10 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
   const order: OpenBlock[] = [];
   let pendingFinish: FinishReason | undefined;
   let pendingUsage: TokenUsage | undefined;
+  // True while a `[DONE]` sentinel has been seen without a following real
+  // payload: the next real payload (or a repeated sentinel) proves it was
+  // mid-stream. A clean terminal `[DONE]` simply leaves the loop ending here.
+  let doneSeen = false;
 
   function open(kind: OpenBlock['kind']): OpenBlock {
     const block: OpenBlock = { index: nextIndex++, kind, text: '' };
@@ -125,7 +179,19 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
   }
 
   for await (const payload of payloads) {
-    if (payload === '[DONE]') continue;
+    if (payload === '[DONE]') {
+      // The sentinel is terminal when it is the last event. Only warn when a
+      // prior sentinel was already seen AND a further payload follows it — a
+      // misbehaving server re-emitting the sentinel, or emitting content after
+      // it. A clean terminal `[DONE]` (loop simply ends after it) warns nothing.
+      if (doneSeen) onSkip?.(MID_STREAM_DONE_WARNING);
+      doneSeen = true;
+      continue;
+    }
+    if (doneSeen) {
+      onSkip?.(MID_STREAM_DONE_WARNING);
+      doneSeen = false;
+    }
     let chunk: WireChunk;
     try {
       chunk = JSON.parse(payload) as WireChunk;

@@ -37,6 +37,7 @@ import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_MAX_TOKENS,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  DEFAULT_LISTING_TIMEOUT_MS,
   LemonadeAdapter,
   discoverModels,
 } from './adapter.js';
@@ -82,6 +83,7 @@ export const Config: z<LemonadeResolvedConfig> = z.object({
   maxTokens: z.number().step(1).min(1).default(DEFAULT_MAX_TOKENS),
   models: z.array(catalogModel).default([]),
   streamIdleTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+  listingTimeoutMs: z.number().min(Number.MIN_VALUE).max(MAX_TIMER_DELAY_MS).default(DEFAULT_LISTING_TIMEOUT_MS),
   retryPolicy: RetryPolicySchema,
 });
 
@@ -95,6 +97,7 @@ export interface LemonadeResolvedConfig {
   maxTokens: number;
   models: LemonadeCatalogModel[];
   streamIdleTimeoutMs: number;
+  listingTimeoutMs: number;
   retryPolicy?: RetryPolicyConfig;
 }
 
@@ -170,6 +173,10 @@ export function resolveAdapterOptions(
   if (!Number.isFinite(streamIdleTimeoutMs) || streamIdleTimeoutMs <= 0 || streamIdleTimeoutMs > MAX_TIMER_DELAY_MS) {
     throw new Error(`llm-lemonade: streamIdleTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`);
   }
+  const listingTimeoutMs = config.listingTimeoutMs ?? DEFAULT_LISTING_TIMEOUT_MS;
+  if (!Number.isFinite(listingTimeoutMs) || listingTimeoutMs <= 0 || listingTimeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(`llm-lemonade: listingTimeoutMs must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`);
+  }
   const rawBase = config.baseURL ?? environment?.get(BASE_URL_ENV)?.value ?? DEFAULT_BASE_URL;
   return {
     apiKeyEnv: credentialRef(config.apiKeyEnv ?? DEFAULT_API_KEY_ENV),
@@ -180,6 +187,7 @@ export function resolveAdapterOptions(
     maxTokens: config.maxTokens ?? DEFAULT_MAX_TOKENS,
     models: resolveModels(config.models),
     streamIdleTimeoutMs,
+    listingTimeoutMs,
     retryPolicy: resolveRetryPolicy(config.retryPolicy, 'llm-lemonade: retryPolicy'),
   };
 }
@@ -252,6 +260,7 @@ export function apply(ctx: Context, config: LemonadeRawConfig): void {
     options,
     resolveApiKey,
     resolveAttachments: () => ctx.get('attachments'),
+    logger: () => ctx.logger,
   });
 
   ctx.llm.registerConfigurableProviders([

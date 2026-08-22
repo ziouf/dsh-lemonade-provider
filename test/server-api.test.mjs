@@ -29,6 +29,8 @@ function makeServer() {
       if (p === '/v1/unload') return send(200, { status: 'ok' });
       if (p === '/v1/delete') return send(200, body && body.model_name === 'ERR' ? { status: 'error', message: 'not found: ERR' } : { status: 'ok' });
       if (p === '/v1/models/X/files') return send(200, { model_id: 'X', files: [{ name: 'model.gguf', role: 'main', size_bytes: 123, exists: true }] });
+      if (p === '/v1/models/lo-adapter/info') return send(200, { id: 'lo-adapter', quant: 'Q4_K_M', size: 340569600 });
+      if (p.startsWith('/v1/extensions/lora/')) return send(200, { status: 'ok', adapter: p.slice('/v1/extensions/lora/'.length) });
       if (p === '/v1/downloads') return send(200, []);
       if (p === '/internal/aliases' && req.method === 'GET') return send(200, { aliases: [{ alias: 'a1', target: 'user.custom', downloaded: true }, { alias: 'a2', target: 'm2' }] });
       if (p === '/internal/aliases' && req.method === 'POST') return send(200, { status: 'ok', alias: body && body.alias, target: body && body.target });
@@ -189,6 +191,29 @@ try {
     ok(!mfBad.ok && mfBad.error.status === 400, 'modelFiles without id → 400');
   });
 
+  await seq('audit: modelInfo + LoRA adapters', async () => {
+    requests.length = 0;
+    const info = await call(cfg(), 'GET', 'modelInfo', ['lo-adapter']);
+    eq(info.ok, true, 'modelInfo ok');
+    eq(requests[0].url, '/v1/models/lo-adapter/info', 'modelInfo path (GET /v1/models/{model}/info)');
+    eq(requests[0].auth, 'Bearer reg-key', 'modelInfo uses regular key');
+    requests.length = 0;
+    const infoBad = await call(cfg(), 'GET', 'modelInfo', []);
+    ok(!infoBad.ok && infoBad.error.status === 400, 'modelInfo without id → 400');
+    requests.length = 0;
+    const list = await call(cfg(), 'GET', 'loraList');
+    eq(list.ok, true, 'loraList ok');
+    eq(requests[0].url, '/v1/extensions/lora/list', 'lora list path');
+    const load = await call(cfg(), 'POST', 'loraLoad', ['lo-adapter']);
+    eq(load.ok, true, 'loraLoad ok');
+    eq(requests[requests.length - 1].url, '/v1/extensions/lora/lo-adapter', 'lora load path (POST /v1/extensions/lora/{adapter})');
+    const unload = await call(cfg(), 'DELETE', 'loraUnload', ['lo-adapter']);
+    eq(unload.ok, true, 'loraUnload ok');
+    eq(requests[requests.length - 1].url, '/v1/extensions/lora/lo-adapter', 'lora unload path (DELETE /v1/extensions/lora/{adapter})');
+    const loadBad = await call(cfg(), 'POST', 'loraLoad', []);
+    ok(!loadBad.ok && loadBad.error.status === 400, 'loraLoad without adapter → 400');
+  });
+
   await seq('audit: registrySearch + pullVariants + pull (spec fields)', async () => {
     requests.length = 0;
     const rs = await call(cfg(), 'GET', 'registrySearch', [], { query: 'qwen', format: 'gguf' });
@@ -241,6 +266,45 @@ try {
     ok(!bad.ok && bad.error.status === 404, '404');
     const meth = await call(cfg(), 'GET', 'unload');
     ok(!meth.ok && meth.error.status === 405, '405 (method mismatch on unload)');
+  });
+
+  await seq('batch ops dispatch each id sequentially through the proxy', async () => {
+    requests.length = 0;
+    const batch = await call(cfg(), 'POST', 'batchLoad', [], {}, { models: ['A', 'B'] });
+    ok(batch.ok, 'batchLoad ok');
+    eq(batch.value.kind, 'load', 'result carries kind');
+    eq(batch.value.total, 2, 'total = 2');
+    eq(batch.value.failed, 0, 'no failures');
+    eq(requests.length, 2, 'two sequential proxy calls');
+    eq(requests[0].url, '/v1/load', 'first call goes to /v1/load');
+    eq(requests[0].body.model_name, 'A', 'first body carries id A (spec model_name)');
+    eq(requests[0].auth, 'Bearer reg-key', 'batch op uses regular key');
+    eq(requests[1].url, '/v1/load', 'second call goes to /v1/load');
+    eq(requests[1].body.model_name, 'B', 'second body carries id B');
+  });
+
+  await seq('batch ops dedupe ids and reject a list without a model', async () => {
+    requests.length = 0;
+    const batch = await call(cfg(), 'POST', 'batchUnload', [], {}, { models: ['C', 'C', 'D'] });
+    ok(batch.ok, 'batchUnload ok');
+    eq(batch.value.total, 2, 'duplicate id deduped to 2');
+    eq(requests.length, 2, 'one proxy call per unique id');
+    requests.length = 0;
+    const noIds = await call(cfg(), 'POST', 'batchDelete', [], {}, {});
+    ok(!noIds.ok && noIds.error.status === 400, 'batchDelete without ids → 400');
+    eq(requests.length, 0, 'no proxy call made');
+  });
+
+  await seq('batch delete reports a failing id alongside successes', async () => {
+    requests.length = 0;
+    const batch = await call(cfg(), 'POST', 'batchDelete', [], {}, { models: ['OK', 'ERR'] });
+    ok(batch.ok, 'batch still ok (individual failures recorded)');
+    eq(batch.value.total, 2, 'total 2');
+    eq(batch.value.failed, 1, 'one recorded failure');
+    const okEntry = batch.value.results.find((r) => r.id === 'OK');
+    const errEntry = batch.value.results.find((r) => r.id === 'ERR');
+    eq(okEntry.ok, true, 'OK entry ok');
+    ok(!errEntry.ok && errEntry.message === 'not found: ERR', 'ERR entry carries server message');
   });
 
   console.log('\n✓ ' + passed + ' assertions OK (server-api)');

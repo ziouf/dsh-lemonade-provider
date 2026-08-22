@@ -42,8 +42,8 @@ export const DEFAULT_CONTEXT_WINDOW = 32768;
 export const DEFAULT_MAX_TOKENS = 8192;
 /** Default maximum idle interval while an adapter stream read is outstanding. */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60_000;
-/** Maximum time one live model-listing query may take. */
-export const LISTING_TIMEOUT_MS = 5_000;
+/** Default maximum time one live model-listing query may take. */
+export const DEFAULT_LISTING_TIMEOUT_MS = 5_000;
 const STREAM_IDLE_TIMEOUT_CODE = 'LLM_STREAM_IDLE_TIMEOUT';
 
 /** One entry of the user-pinned advisory model catalog. */
@@ -66,6 +66,7 @@ export interface LemonadeOptions {
   maxTokens: number;
   models: LemonadeCatalogModel[];
   streamIdleTimeoutMs: number;
+  listingTimeoutMs: number;
   retryPolicy: ResolvedRetryPolicy;
 }
 
@@ -77,6 +78,8 @@ export interface LemonadeAdapterConfig {
   resolveApiKey(): Promise<string | undefined>;
   /** The attachment service, when one is mounted (needed to send images). */
   resolveAttachments(): AttachmentStore | undefined;
+  /** Optional sink for soft, non-fatal stream warnings (mid-stream `[DONE]`, skipped payloads). */
+  logger?: () => { warn(...args: unknown[]): void };
 }
 
 /** One Lemonade model entry as read from `GET /v1/models`. */
@@ -259,7 +262,7 @@ export class LemonadeAdapter extends LlmAdapter {
     // No configured selection: advertise whatever the server currently offers.
     try {
       const apiKey = await this.config.resolveApiKey();
-      const entries = await fetchModelEntries(options.baseURL, apiKey, AbortSignal.timeout(LISTING_TIMEOUT_MS));
+      const entries = await fetchModelEntries(options.baseURL, apiKey, AbortSignal.timeout(options.listingTimeoutMs ?? DEFAULT_LISTING_TIMEOUT_MS));
       this.lastKnown = new Map(entries.map((entry) => [entry.id, entry]));
       return entries.map((entry) => modelInfo(provider, entry.id, entry));
     } catch {
@@ -376,6 +379,10 @@ export class LemonadeAdapter extends LlmAdapter {
       });
     }
     if (!response.body) throw new LlmError('Lemonade API returned no response body', 'EMPTY_RESPONSE');
-    yield* translate(parseSse(response.body, onComment));
+    const warn = (reason: string): void => { this.config.logger?.().warn(reason); };
+    yield* translate(
+      parseSse(response.body, onComment, warn),
+      warn,
+    );
   }
 }

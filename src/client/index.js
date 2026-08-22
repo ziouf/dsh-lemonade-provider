@@ -110,6 +110,25 @@ window.__ModuleLoader__.load({
 			downloadedSuffix: " (downloaded)",
 			filesNone: "No local files.",
 			missingSuffix: " (missing)",
+			logsTitle: "Logs",
+			logsTooltip: "Live stream of the Lemonade server logs (WebSocket /logs/stream)",
+			logsConnecting: "connecting…",
+			logsConnected: "connected",
+			logsOffline: "logs unavailable",
+			logsAutoScroll: "Auto-scroll",
+			logLines: "{count} log line(s) shown",
+			logsKeepAlive: "Reconnect",
+			logsKeepAliveTitle: "Re-open the log stream",
+			logsClosed: "Log stream closed.",
+			logsError: "Log stream error.",
+			batchHeader: "Batch action",
+			batchLoad: "Load selected",
+			batchUnload: "Unload selected",
+			batchDelete: "Delete selected",
+			batchProgress: "Running {done}/{total}",
+			batchOk: "Batch done ({failed} failed)",
+			modalClose: "Close",
+			modalConfirm: "Confirm",
 		};
 
 		/** Lookup + {param} interpolation; English is the default fallback. */
@@ -126,7 +145,15 @@ window.__ModuleLoader__.load({
 		}
 		const fallbackT = makeT(EN);
 
-		/** Same-origin call to the host proxy; returns the normalized wire result. */
+		/** Same-origin call to the host proxy; returns the normalized wire result.
+		 *
+		 * Distinguishes three outcomes: a network failure (fetch throws — server
+		 * unreachable) as code "CLIENT" with status 0, an HTTP error whose body is
+		 * not the host wire format as "HTTP_<status>", and the host's own wire
+		 * result (which carries the HTTP `status` and a stable `code`) unchanged.
+		 * Reading the raw text first (not res.json()) keeps an error status from
+		 * being swallowed when the body is non-JSON.
+		 */
 		async function apiCall(op, segments, queryObj, method, bodyObj) {
 			let url = API + "/" + op;
 			if (segments && segments.length) {
@@ -146,13 +173,28 @@ window.__ModuleLoader__.load({
 				init.headers["content-type"] = "application/json";
 				init.body = JSON.stringify(bodyObj);
 			}
+			let res;
 			try {
-				const res = await fetch(url, init);
-				const data = await res.json().catch(() => null);
-				return data;
+				res = await fetch(url, init);
 			} catch (e) {
-				return { ok: false, error: { message: String((e && e.message) || e), code: "CLIENT" } };
+				return { ok: false, error: { message: String((e && e.message) || e), code: "CLIENT", status: 0 } };
 			}
+			const text = await res.text().catch(() => "");
+			let data = null;
+			if (text.length > 0) {
+				try { data = JSON.parse(text); } catch { data = null; }
+			}
+			// HTTP error without the host wire shape (non-JSON body, or a bare
+			// object): surface the status as a stable "HTTP_<status>" error.
+			if (!res.ok && (!data || typeof data !== "object" || !("ok" in data))) {
+				return {
+					ok: false,
+					error: { message: data && (data.error && data.error.message) ? data.error.message : String((data && data.message) || "HTTP " + res.status), code: "HTTP_" + res.status, status: res.status },
+				};
+			}
+			// Host wire result ({ ok, error: { message, code, status? } }) — keep
+			// the host code and its HTTP status intact so the UI can distinguish.
+			return data;
 		}
 
 		const fmt = (value) => (value === undefined || value === null ? "—" : String(value));
@@ -196,6 +238,84 @@ window.__ModuleLoader__.load({
 		};
 		const el = (type, props, ...children) => h(type, props || {}, ...children);
 
+		/**
+		 * Live log pane. Opens an SSE connection to the host proxy's logsStream
+		 * route (which itself owns a WebSocket client to Lemonade) and appends
+		 * each upstream `data:` line as a log entry. Holds no internal timer: a
+		 * reconnect button re-mounts the effect.
+		 */
+		function LogsStream(props) {
+			const t = props.t;
+			const [lines, setLines] = useState([]);
+			const [status, setStatus] = useState(t("logsConnecting"));
+			const [autoScroll, setAutoScroll] = useState(true);
+			const [logEl, setLogEl] = useState(null);
+			const [retry, setRetry] = useState(0);
+
+			const append = (text, isError) => {
+				setLines((prev) => {
+					const next = prev.concat({ text: text, isError: !!isError });
+					return next.length > 500 ? next.slice(-500) : next;
+				});
+			};
+
+			useEffect(() => {
+				const controller = new AbortController();
+				setStatus(t("logsConnecting"));
+				fetch(API + "/logsStream", { headers: {}, signal: controller.signal })
+					.then(async (res) => {
+						if (!res.ok) {
+							append(t("logsError") + " HTTP " + (res.status || ""), true);
+							setStatus(t("logsOffline"));
+							return;
+						}
+						setStatus(t("logsConnected"));
+						const reader = res.body.getReader();
+						const decoder = new TextDecoder();
+						let buffer = "";
+						const loop = async () => {
+							for (;;) {
+								const { done, value } = await reader.read();
+								if (done) { setStatus(t("logsClosed")); return; }
+								buffer += decoder.decode(value, { stream: true });
+								let nl;
+								while ((nl = buffer.indexOf("\n")) >= 0) {
+									const line = buffer.slice(0, nl).replace(/\r$/, "").trim();
+									buffer = buffer.slice(nl + 1);
+									if (!line || line.indexOf("event:") === 0) continue;
+									if (line.indexOf("data:") === 0) append(line.slice(5).trim(), false);
+								}
+							}
+						};
+						void loop();
+					})
+					.catch(() => { setStatus(t("logsOffline")); });
+				return () => controller.abort();
+			}, [t, retry]);
+
+			useEffect(() => {
+				if (autoScroll && logEl) logEl.scrollTop = logEl.scrollHeight;
+			}, [lines, autoScroll, logEl]);
+
+			const connected = status.indexOf("connected") >= 0 || status.indexOf("connecting") >= 0;
+
+			return h("div", { style: styles.card },
+				h("div", { style: styles.row, justifyContent: "space-between" },
+					h("span", { style: { ...styles.cardTitle, display: "flex", alignItems: "center", gap: "6px" } },
+						h("span", { style: { ...styles.badge, ...(connected ? styles.badgeOk : styles.badgeBad) } }, "●"),
+						t("logsTitle")),
+					h("div", { style: styles.row },
+						h("label", { style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "12px" } },
+							h("input", { type: "checkbox", checked: autoScroll === true, onChange: (e) => setAutoScroll(e.target.checked) }),
+							t("logsAutoScroll")),
+						h("button", { style: styles.button, title: t("logsKeepAliveTitle"), onClick: () => setRetry((r) => r + 1) }, t("logsKeepAlive"))),
+				),
+				h("div", { style: { maxHeight: 360, overflow: "auto", background: "var(--dsw-alias-bg-secondary, #f6f8fa)", borderRadius: 6, padding: "6px 8px", fontFamily: "monospace", fontSize: "12px", whiteSpace: "pre-wrap", wordBreak: "break-word" } },
+					h("div", { ref: logEl }, lines.map((l, i) => h("div", { key: i, style: { color: l.isError ? "#d1242f" : "inherit", opacity: l.isError ? 0.9 : 1 } }, l.text)))),
+				h("p", { style: styles.muted }, t("logLines", { count: lines.length })),
+			);
+		}
+
 		function LemonadeServerView(props) {
 			const api = props.api;
 			const t = props && typeof props.t === "function" ? props.t : fallbackT;
@@ -223,6 +343,10 @@ window.__ModuleLoader__.load({
 			const [aliasTarget, setAliasTarget] = useState("");
 			const [adminOpen, setAdminOpen] = useState(true);
 			const [autoRefresh, setAutoRefresh] = useState(true);
+			const [selectedModels, setSelectedModels] = useState({});
+			const [batchRunning, setBatchRunning] = useState(undefined);
+			const [modal, setModal] = useState(undefined);
+			const [logsOpen, setLogsOpen] = useState(false);
 
 			const loadHealth = useCallback(async () => {
 				const res = await apiCall("health");
@@ -255,6 +379,13 @@ window.__ModuleLoader__.load({
 				setBusy(false);
 			}, [loadHealth, loadTelemetry, loadModels, loadDownloads, loadAliases]);
 			useEffect(() => { loadAll(); }, [loadAll]);
+			// Notices self-dismiss after 5s so a transient "Model loaded" message
+			// cannot linger in the pane once the view re-renders for other reasons.
+			useEffect(() => {
+				if (notice === undefined) return undefined;
+				const timer = setTimeout(() => setNotice(undefined), 5000);
+				return () => clearTimeout(timer);
+			}, [notice]);
 			useEffect(() => {
 				if (!autoRefresh) return;
 				const timer = setInterval(() => { loadHealth(); loadTelemetry(); }, 10000);
@@ -281,6 +412,34 @@ window.__ModuleLoader__.load({
 			};
 
 			const loadedByModel = (id) => (health && Array.isArray(health.all_models_loaded) ? health.all_models_loaded : []).find((m) => m.model_name === id);
+
+			// Batch multi-select: selectedModels maps model id -> boolean. A batch
+			// action dispatches one POST per id through the host proxy and reports
+			// how many failed alongside the successes.
+			const selectedIds = (Array.isArray(models) ? models : []).filter((m) => (m && selectedModels[m.id] === true)).map((m) => m.id);
+			const toggleSelect = (id) => setSelectedModels((prev) => ({ ...prev, [id]: !prev[id] }));
+			const runBatch = async (op, label) => {
+				if (!selectedIds.length) return;
+				setBatchRunning({ op, total: selectedIds.length, done: 0, failed: 0 });
+				let failed = 0;
+				for (const id of selectedIds) {
+					const r = await apiCall(op, [], undefined, "POST", { models: [id] });
+					if (!r || !r.ok) failed += 1;
+					setBatchRunning((prev) => prev && { ...prev, done: prev.done + 1, failed });
+				}
+				const done = selectedIds.length - failed;
+				setBatchRunning(undefined);
+				setSelectedModels({});
+				setNotice(t("batchOk", { failed: failed }));
+				await loadAll();
+			};
+
+			// Custom confirm modal: replaces the native confirm(); the caller
+			// passes message/confirmLabel and an onConfirm callback.
+			const ask = (message, confirmLabel, onConfirm) => {
+				setModal({ message, confirmLabel, onConfirm });
+			};
+			const closeAsk = () => setModal(undefined);
 
 			// The tab lists every model the server advertises, optionally filtered
 			// to downloaded ones (checkbox in the block header, checked by default).
@@ -354,6 +513,7 @@ window.__ModuleLoader__.load({
 					el("span", { style: styles.muted }, health && health.version ? "v" + health.version : ""),
 					el("button", { style: styles.button, disabled: busy, onClick: () => loadAll() }, busy ? t("loading") : t("refresh")),
 					el("button", { style: styles.button, disabled: busy, onClick: () => setAutoRefresh((v) => !v) }, t(autoRefresh ? "autoOn" : "autoOff")),
+					el("button", { style: { ...styles.button, opacity: logsOpen ? 1 : 0.6 }, title: t("logsTooltip"), onClick: () => setLogsOpen((v) => !v) }, "◉ " + t("logsTitle")),
 				),
 				el("p", { style: styles.muted }, serverURL),
 				healthErr && !healthOk ? el("p", { style: styles.error },
@@ -386,6 +546,10 @@ window.__ModuleLoader__.load({
 				el("details", { style: { ...styles.card, marginTop: 0 }, open: modelsOpen, onToggle: (e) => setModelsOpen(e.target.open) },
 					el("summary", { style: { ...styles.cardTitle, cursor: "pointer" }, title: t("modelsTooltip") }, t("models") + (Array.isArray(visibleModels) ? " (" + visibleModels.length + ")" : "")),
 					el("div", { style: styles.row, justifyContent: "flex-end" },
+						selectedIds.length ? el("div", { style: { display: "flex", alignItems: "center", gap: "4px", fontSize: "12px", opacity: 0.75 } }, t("batchHeader") + " " + selectedIds.length) : null,
+						el("button", { style: { ...styles.button, opacity: selectedIds.length ? 1 : 0.5 }, disabled: busy || !selectedIds.length, onClick: () => runBatch("batchLoad", t("batchLoad")) }, busy && batchRunning && batchRunning.op === "batchLoad" ? t("batchProgress", { done: batchRunning.done, total: batchRunning.total }) : t("batchLoad")),
+						el("button", { style: { ...styles.button, opacity: selectedIds.length ? 1 : 0.5 }, disabled: busy || !selectedIds.length, onClick: () => runBatch("batchUnload", t("batchUnload")) }, busy && batchRunning && batchRunning.op === "batchUnload" ? t("batchProgress", { done: batchRunning.done, total: batchRunning.total }) : t("batchUnload")),
+						el("button", { style: { ...styles.buttonDanger, opacity: selectedIds.length ? 1 : 0.5 }, disabled: busy || !selectedIds.length, onClick: () => runBatch("batchDelete", t("batchDelete")) }, t("batchDelete")),
 						el("label", { style: { display: "flex", alignItems: "center", gap: "6px", fontSize: "13px" } },
 							el("input", { type: "checkbox", checked: onlyDownloaded === true, onChange: (e) => setOnlyDownloaded(e.target.checked) }),
 							t("onlyDownloaded"),
@@ -397,6 +561,9 @@ window.__ModuleLoader__.load({
 					Array.isArray(visibleModels) && visibleModels.length === 0 ? el("p", { style: styles.muted }, t("noModels")) : null,
 					Array.isArray(visibleModels) && visibleModels.length > 0 ? el("table", { style: styles.table },
 						el("thead", null, el("tr", null,
+							el("th", { style: { ...styles.th, width: 40 } },
+								(visibleModels.length > 0 && selectedIds.length === visibleModels.length) ? el("input", { type: "checkbox", checked: true, onChange: () => { const all = visibleModels.every((m) => selectedModels[m.id] === true); setSelectedModels(Object.fromEntries(visibleModels.map((m) => [m.id, !all]))); } }) : el("input", { type: "checkbox", onChange: () => { const all = visibleModels.every((m) => selectedModels[m.id] === true); setSelectedModels(Object.fromEntries(visibleModels.map((m) => [m.id, !all]))); } })
+							),
 							el("th", { style: styles.th }, t("thModel")),
 							el("th", { style: styles.th }, t("thRecipe")),
 							el("th", { style: styles.th }, t("thSize")),
@@ -405,7 +572,11 @@ window.__ModuleLoader__.load({
 						)),
 						el("tbody", null, visibleModels.map((m) => {
 							const loaded = loadedByModel(m.id);
-							return el("tr", { key: m.id },
+							const checked = selectedModels[m.id] === true;
+							return el("tr", { key: m.id, style: { background: checked ? "rgba(26,127,55,0.05)" : "transparent" } },
+								el("td", { style: styles.td },
+									el("input", { type: "checkbox", checked: checked, onChange: () => toggleSelect(m.id) }),
+								),
 								el("td", { style: styles.td },
 									el("span", null, m.id),
 									m.update_available ? el("span", { style: { ...styles.chip, borderColor: "#9a6700", color: "#9a6700" } }, t("updateBadge")) : null,
@@ -422,7 +593,7 @@ window.__ModuleLoader__.load({
 											: m.downloaded === false ? el("button", { style: styles.button, disabled: busy, onClick: () => run(async () => { const r = await apiCall("pull", [], undefined, "POST", { checkpoint: m.id }); if (!r || !r.ok) throw new Error(errMsg(r)); }, t("downloadStarted")) }, t("download"))
 											: el("button", { style: styles.button, disabled: busy, onClick: () => run(async () => { const r = await apiCall("load", [], undefined, "POST", { model: m.id }); if (!r || !r.ok) throw new Error(errMsg(r)); }, t("modelLoaded")) }, t("load")),
 										el("button", { style: styles.button, disabled: busy, onClick: () => toggleFiles(m.id) }, t("files")),
-										el("button", { style: styles.buttonDanger, disabled: busy, onClick: () => { if (confirm(t("confirmDeleteModel", { model: m.id }))) run(async () => { const r = await apiCall("delete", [], undefined, "POST", { model: m.id }); if (!r || !r.ok) throw new Error(errMsg(r)); }, t("modelDeleted")); } }, t("delete")),
+												el("button", { style: styles.buttonDanger, disabled: busy, onClick: () => ask(t("confirmDeleteModel", { model: m.id }), t("delete"), () => run(async () => { const r = await apiCall("delete", [], undefined, "POST", { model: m.id }); if (!r || !r.ok) throw new Error(errMsg(r)); }, t("modelDeleted"))) }, t("delete")),
 									),
 									filesById[m.id] !== undefined ? divFiles(filesById[m.id], t) : null,
 								),
@@ -452,7 +623,7 @@ window.__ModuleLoader__.load({
 					Array.isArray(aliases) && aliases.length > 0 ? el("ul", { style: { margin: "4px 0 0 0", padding: 0, listStyle: "none" } },
 						aliases.map((al) => el("li", { key: al.alias, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0", borderBottom: "1px solid var(--dsw-alias-border-l2, #d0d7de)" } },
 							el("span", { style: { fontSize: "13px" } }, String(al.alias) + " → " + String(al.target || al.model || "") + (al.downloaded === true ? t("downloadedSuffix") : "")),
-							el("button", { style: styles.buttonDanger, disabled: busy, onClick: () => { if (confirm(t("confirmDeleteAlias", { alias: al.alias }))) run(async () => { const r = await apiCall("internalAliasesDelete", [al.alias]); if (!r || !r.ok) throw new Error(errMsg(r)); setAliases((prev) => Array.isArray(prev) ? prev.filter((x) => x.alias !== al.alias) : prev); }, t("aliasDeleted")); } }, t("delete")),
+							el("button", { style: styles.buttonDanger, disabled: busy, onClick: () => ask(t("confirmDeleteAlias", { alias: al.alias }), t("delete"), () => run(async () => { const r = await apiCall("internalAliasesDelete", [al.alias]); if (!r || !r.ok) throw new Error(errMsg(r)); setAliases((prev) => Array.isArray(prev) ? prev.filter((x) => x.alias !== al.alias) : prev); }, t("aliasDeleted"))) }, t("delete")),
 						))) : null,
 				),
 
@@ -466,6 +637,27 @@ window.__ModuleLoader__.load({
 
 				error !== undefined ? el("p", { style: styles.error }, String(error)) : null,
 				notice !== undefined ? el("p", { style: styles.success }, String(notice)) : null,
+
+				logsOpen ? el("div", { style: styles.card }, h(LogsStream, { t })) : null,
+
+				modal ? h(ConfirmationModal, {
+					message: modal.message,
+					confirmLabel: modal.confirmLabel,
+					onCancel: closeAsk,
+					onConfirm: () => { const onConfirm = modal.onConfirm; closeAsk(); if (onConfirm) onConfirm(); },
+				}) : null,
+			);
+		}
+
+		/** Custom confirm modal rendered in place of the native confirm(). */
+		function ConfirmationModal(props) {
+			const { message, onConfirm, onCancel, confirmLabel } = props;
+			return h("div", { style: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, fontFamily: "var(--dsw-font-family, sans-serif)" } },
+				h("div", { style: { background: "var(--dsw-alias-bg, #fff)", borderRadius: "10px", padding: "18px 20px", minWidth: 260, maxWidth: 420, boxShadow: "0 8px 30px rgba(0,0,0,0.18)" } },
+					h("div", { style: { fontSize: "15px", lineHeight: 1.5, marginBottom: "16px" } }, message),
+					h("div", { style: { display: "flex", justifyContent: "flex-end", gap: "8px" } },
+						h("button", { style: { padding: "6px 14px", fontSize: "13px", borderRadius: "6px", border: "1px solid var(--dsw-alias-border-l2, #d0d7de)", background: "#fff", cursor: "pointer" }, onClick: onCancel }, t("modalClose")),
+						h("button", { style: { padding: "6px 14px", fontSize: "13px", borderRadius: "6px", border: "none", background: "#1a7f37", color: "#fff", cursor: "pointer" }, onClick: onConfirm }, confirmLabel || t("modalConfirm")))),
 			);
 		}
 

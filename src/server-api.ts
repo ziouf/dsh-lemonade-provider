@@ -12,11 +12,16 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials';
 import { attributionHeaders } from '@deepseek-ai/dsh-llm';
 import { deadline, timeoutOf } from '@deepseek-ai/dsh-timeout';
+import { JsonParseError, parseJsonValue } from './json-parse.js';
 
 /** Route prefix registered on ctx.webServer. */
 export const API_ROUTE = '/dsh-lemonade/api';
 /** Maximum accepted request body and proxied response body in bytes. */
 export const MAX_BODY_BYTES = 1_000_000;
+/** Maximum JSON nesting depth accepted in a proxied request body. */
+export const MAX_JSON_DEPTH = 64;
+/** Maximum path length after the route prefix (op + args). */
+export const MAX_SEGMENTS = 5;
 /** Fetch timeout for proxied Lemonade calls. */
 export const API_TIMEOUT_MS = 10_000;
 const TIMEOUT_CODE = 'LEMONADE_API_TIMEOUT';
@@ -157,6 +162,11 @@ function resolveTarget(
       if (mn === undefined) throw new RequestError('model required', 'INVALID_REQUEST', 400);
       return { method: 'POST', url: '/v1/delete', body: { model_name: mn } };
     }
+    case 'modelInfo': {
+      const id = args[0];
+      if (id === undefined || id.length === 0) throw new RequestError('model id required', 'INVALID_REQUEST', 400);
+      return { method: 'GET', url: '/v1/models/' + encodeURIComponent(id) + '/info' };
+    }
     case 'checkUpdates': return { method: 'POST', url: '/v1/models/check-updates' };
     case 'registrySearch':
       return {
@@ -183,6 +193,17 @@ function resolveTarget(
         url: '/v1/pull',
         body: pick(['model_name', 'recipe', 'checkpoint', 'checkpoints', 'reasoning', 'vision', 'embedding', 'reranking', 'mmproj', 'stream', 'subscribe']),
       };
+    case 'loraList': return { method: 'GET', url: '/v1/extensions/lora/list' };
+    case 'loraLoad': {
+      const adapter = args[0];
+      if (adapter === undefined || adapter.length === 0) throw new RequestError('adapter id required', 'INVALID_REQUEST', 400);
+      return { method: 'POST', url: '/v1/extensions/lora/' + encodeURIComponent(adapter) };
+    }
+    case 'loraUnload': {
+      const adapter = args[0];
+      if (adapter === undefined || adapter.length === 0) throw new RequestError('adapter id required', 'INVALID_REQUEST', 400);
+      return { method: 'DELETE', url: '/v1/extensions/lora/' + encodeURIComponent(adapter) };
+    }
     case 'downloads': return { method: 'GET', url: '/v1/downloads' };
     case 'downloadsControl': return { method: 'POST', url: '/v1/downloads/control', body: pick(['id', 'action']) };
     case 'stats': return { method: 'GET', url: '/v1/stats' };
@@ -237,6 +258,23 @@ export async function serveLemonadeApi(
   body: unknown,
   signal?: AbortSignal,
 ): Promise<LemonadeWireResult> {
+  // Batch operations are intercepted before resolveTarget: they are not a
+  // single Lemonade endpoint but a sequence of one dispatched through postLemonade.
+  if (op === 'batchLoad' || op === 'batchUnload' || op === 'batchDelete') {
+    const ids = collectBatchIds(body);
+    if (ids.length === 0) {
+      return errResult('batch ' + op + ' requires a non-empty "models" list', 'INVALID_REQUEST', 400);
+    }
+    const build = (id: string): { method: 'GET' | 'POST' | 'DELETE'; url: string; body?: unknown } => {
+      switch (op) {
+        case 'batchLoad': return { method: 'POST', url: '/v1/load', body: { model_name: id } };
+        case 'batchUnload': return { method: 'POST', url: '/v1/unload', body: { model_name: id } };
+        default: return { method: 'POST', url: '/v1/delete', body: { model_name: id } };
+      }
+    };
+    const kind = op === 'batchLoad' ? 'load' : op === 'batchUnload' ? 'unload' : 'delete';
+    return batchRun(cfg, kind, ids, build);
+  }
   let target: { method: 'GET' | 'POST' | 'DELETE'; url: string; body?: unknown };
   try {
     target = resolveTarget(op, args, query, body);
@@ -251,11 +289,97 @@ export async function serveLemonadeApi(
       405,
     );
   }
-  // Per-endpoint key selection: internal/control endpoints (/internal/*, /metrics)
-  // authenticate with the admin key (falling back to the regular key, which
-  // lemonade accepts for /metrics); regular endpoints use the regular key (the
-  // admin key is a superior credential and also works when it is the only one set).
-  const admin = isAdminOp(op);
+  return postLemonade(cfg, target.url, target.method, target.body, isAdminOp(op), signal);
+}
+
+/** One sub-call of a batch operation: its resolved target plus its id. */
+interface BatchCall {
+  id: string;
+  target: { method: 'GET' | 'POST' | 'DELETE'; url: string; body?: unknown };
+}
+
+/**
+ * Extract the target model ids from a batch-operation body. Lemonade uses the
+ * `model_name` field per spec, so accept both `models` and `model_name` (single
+ * or list) and ignore any other keys.
+ */
+function collectBatchIds(body: unknown): string[] {
+  const record = asRecord(body);
+  const collect = (key: 'models' | 'model_name'): string[] => {
+    const raw = record[key];
+    if (Array.isArray(raw)) {
+      return raw.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    }
+    return typeof raw === 'string' && raw.length > 0 ? [raw] : [];
+  };
+  const ids = collect('models').concat(collect('model_name'));
+  // De-duplicate while preserving order.
+  const seen = new Set<string>();
+  return ids.filter((id) => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+/**
+ * Run a batch of sub-calls against Lemonade, dispatching each sequentially
+ * through {@link postLemonade} (reusing per-endpoint key selection, the
+ * /api-vs-root rule, the shared timer, and status/body normalization). Each
+ * sub-call error is recorded alongside the successful ones rather than
+ * aborting the whole batch; the wire result carries `ok: true` with a
+ * structured payload listing every item and its status.
+ *
+ * @param cfg - connection facts (thunks resolved per call).
+ * @param kind - the operation class ("load", "unload", "delete").
+ * @param ids - the identifiers to apply the operation to.
+ * @param build - build one sub-call target for an id (path/body), or throw.
+ */
+async function batchRun(
+  cfg: LemonadeApiConfig,
+  kind: 'load' | 'unload' | 'delete',
+  ids: readonly string[],
+  build: (id: string) => { method: 'GET' | 'POST' | 'DELETE'; url: string; body?: unknown },
+): Promise<LemonadeWireResult> {
+  const calls: BatchCall[] = [];
+  for (const id of ids) {
+    try {
+      calls.push({ id, target: build(id) });
+    } catch (error) {
+      if (error instanceof RequestError) return errResult(error.message, error.code, error.status);
+      throw error;
+    }
+  }
+  const results = [];
+  for (const call of calls) {
+    const wire = await postLemonade(cfg, call.target.url, call.target.method, call.target.body, false, undefined);
+    results.push({
+      id: call.id,
+      ok: wire.ok,
+      message: wire.ok ? undefined : (wire.error && (wire.error.message || wire.error.code)),
+      status: wire.ok ? undefined : wire.error.status,
+    });
+  }
+  const failed = results.filter((r) => !r.ok).length;
+  return okResult({ kind, total: results.length, failed, results });
+}
+
+/**
+ * Perform the HTTP round-trip to Lemonade and normalize the response into a
+ * wire result. Shared by {@link serveLemonadeApi} (single op) and the batch
+ * ops: it resolves the per-endpoint API key (from the target url), builds the
+ * fully-qualified URL (root vs /api prefix), runs the fetch under the shared
+ * timer, and applies the status/body normalization. `admin` selects the admin
+ * vs regular credential and drives the root-path rule.
+ */
+async function postLemonade(
+  cfg: LemonadeApiConfig,
+  url: string,
+  method: 'GET' | 'POST' | 'DELETE',
+  body: unknown,
+  admin: boolean,
+  signal?: AbortSignal,
+): Promise<LemonadeWireResult> {
   const regularKey = await cfg.resolveKey(cfg.apiKeyRef());
   const adminKey = await cfg.resolveKey(cfg.adminApiKeyRef());
   const apiKey = admin ? (adminKey ?? regularKey) : (regularKey ?? adminKey);
@@ -268,20 +392,20 @@ export async function serveLemonadeApi(
   const configured = (cfg.baseURL() || '').replace(/\/+$/, '').replace(/\/v1$/i, '');
   // /internal/*, /live and /metrics are ROOT-level (no /api, no /v1) per spec;
   // everything else is served under the /api prefix.
-  const isRootPath = target.url.startsWith('/internal/') || target.url === '/live' || target.url === '/metrics';
+  const isRootPath = url.startsWith('/internal/') || url === '/live' || url === '/metrics';
   const base = isRootPath ? configured.replace(/\/api$/i, '') : configured;
-  const url = base + target.url;
+  const fullUrl = base + url;
   const headers: Record<string, string> = { accept: 'application/json', ...attributionHeaders() };
   if (apiKey !== undefined) headers.authorization = 'Bearer ' + apiKey;
-  if (target.body !== undefined) headers['content-type'] = 'application/json';
+  if (body !== undefined) headers['content-type'] = 'application/json';
 
   const timer = deadline(signal, API_TIMEOUT_MS, TIMEOUT_CODE);
   let response: Response;
   try {
-    response = await fetch(url, {
-      method: target.method,
+    response = await fetch(fullUrl, {
+      method,
       headers,
-      ...(target.body === undefined ? {} : { body: JSON.stringify(target.body) }),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: timer.signal,
     });
   } catch (error) {
@@ -289,9 +413,15 @@ export async function serveLemonadeApi(
       return errResult('Lemonade API timeout after ' + API_TIMEOUT_MS + 'ms', 'TIMEOUT');
     }
     if (signal !== undefined && signal.aborted) return errResult('Lemonade request aborted by caller', 'ABORTED');
-    return errResult('could not reach ' + url, 'TRANSPORT');
+    return errResult('could not reach ' + fullUrl, 'TRANSPORT');
   } finally {
-    timer[Symbol.dispose]();
+    // Wrap cleanup in try/catch so a timer teardown error (it should never
+    // throw) can't mask the original throw/return from the block above.
+    try {
+      timer[Symbol.dispose]();
+    } catch {
+      // ignore — the timer is disposable and teardown errors are non-fatal
+    }
   }
 
   const decoded = await readResponseText(response);
@@ -300,14 +430,14 @@ export async function serveLemonadeApi(
   }
   let value: unknown = null;
   if (decoded.text.length > 0) {
-    if (op === 'metrics') {
+    if (url === '/metrics') {
       // Prometheus text exposition format, not JSON.
       value = decoded.text;
     } else {
       try {
         value = JSON.parse(decoded.text);
       } catch {
-        return errResult('Lemonade answered with non-JSON at ' + url, 'BAD_RESPONSE', 502);
+        return errResult('Lemonade answered with non-JSON at ' + fullUrl, 'BAD_RESPONSE', 502);
       }
     }
   }
@@ -332,6 +462,36 @@ export async function serveLemonadeApi(
   return okResult(value);
 }
 
+/**
+ * Parse one request body as JSON with a hard nesting-depth cap, so a hostile
+ * client cannot send a "JSON bomb" (a tree whose width is small but whose
+ * depth is enormous, whose naive JSON.parse stack would blow). Throws a
+ * RequestError (INVALID_REQUEST 400) on malformed input or on exceeding the
+ * depth cap, carrying the byte offset of the offending token so the client can
+ * point at the exact character.
+ */
+/**
+ * Parse one request body as JSON with a hard nesting-depth cap, so a hostile
+ * client cannot send a "JSON bomb" (a tree whose width is small but whose
+ * depth is enormous, whose naive JSON.parse stack would blow). A malformed or
+ * too-deep body becomes a {@link RequestError} (INVALID_REQUEST 400) carrying
+ * the byte offset of the offending token, so the client can point at the exact
+ * character; a body over {@link MAX_BODY_BYTES} stays a 413.
+ */
+function parseJsonRequest(text: string): unknown {
+  try {
+    return parseJsonValue(text, { maxDepth: MAX_JSON_DEPTH });
+  } catch (error) {
+    if (error instanceof JsonParseError) {
+      const detail = error.isDepthOverflow
+        ? 'request body exceeds JSON depth ' + MAX_JSON_DEPTH
+        : 'request body is not valid JSON near offset ' + error.position;
+      throw new RequestError(detail, 'INVALID_REQUEST', 400);
+    }
+    throw error;
+  }
+}
+
 async function readRequestBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -343,11 +503,7 @@ async function readRequestBody(req: IncomingMessage): Promise<unknown> {
   if (chunks.length === 0) return undefined;
   const text = Buffer.concat(chunks).toString('utf8');
   if (text.trim().length === 0) return undefined;
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new RequestError('request body is not valid JSON', 'INVALID_REQUEST', 400);
-  }
+  return parseJsonRequest(text);
 }
 
 function writeJson(res: ServerResponse, status: number, value: unknown): void {
@@ -369,6 +525,133 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  * held open and closed when the browser disconnects.
  */
 
+/** Write one Server-Sent-Event line (`event:` + `data:`), splitting multi-line payloads. */
+function writeSse(res: ServerResponse, event: string, data: string): void {
+  res.write('event: ' + event + '\n');
+  const parts = data.replace(/\r\n/g, '\n').split('\n');
+  for (const line of parts) {
+    res.write('data: ' + line + '\n');
+  }
+  res.write('\n');
+}
+
+/**
+ * Serve the Lemonade server log stream to the browser as an SSE feed.
+ *
+ * The browser holds a plain HTTP/SSE connection to the host proxy (which owns
+ * the credentials); the proxy, in turn, opens a WebSocket *client* to the
+ * Lemonade log endpoint and re-emits every upstream message as an SSE event. A
+ * client→Lemonade relay is mandatory here: Node's runtime exposes no
+ * server-side WebSocket API and the `ws` package is not installable, so the
+ * relay can never accept an upgrade itself. The log port is discovered from
+ * /v1/health (`websocket_port`, which shares the Realtime Audio port and
+ * therefore differs from the main API port), the log message is authenticated
+ * through the regular API key, and the response is held open and closed when
+ * the browser disconnects.
+ */
+async function serveLogsStream(
+  cfg: LemonadeApiConfig,
+  res: ServerResponse,
+  signal?: AbortSignal,
+): Promise<void> {
+  const key = await cfg.resolveKey(cfg.apiKeyRef());
+  const configured = (cfg.baseURL() || '').replace(/\/+$/, '').replace(/\/v1$/i, '');
+  const healthUrl = configured + '/v1/health';
+
+  const openHeaders: Record<string, string> = {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store',
+    connection: 'close',
+    // Disable proxy buffering that would defeat the streaming contract.
+    'x-accel-buffering': 'no',
+  };
+  res.writeHead(200, openHeaders);
+  writeSse(res, 'comment', 'streaming logs');
+
+  // Discover the WebSocket port from health before touching the log endpoint.
+  let health: { status?: string; websocket_port?: number } | undefined;
+  try {
+    const resp = await fetch(healthUrl, { headers: { accept: 'application/json' } });
+    const text = await resp.text().catch(() => '');
+    if (text.trim().length > 0) {
+      const parsed = JSON.parse(text) as { status?: string; websocket_port?: number };
+      health = parsed;
+    }
+  } catch {
+    writeSse(res, 'error', 'could not reach ' + healthUrl);
+    res.end();
+    return;
+  }
+  const port = health && typeof health.websocket_port === 'number' ? health.websocket_port : undefined;
+  if (!port || port <= 0) {
+    writeSse(res, 'error', 'Lemonade server did not advertise a websocket_port');
+    res.end();
+    return;
+  }
+  // Reuse the host of the configured base URL, but speak ws over the log port.
+  const base = new URL(configured);
+  const wsUrl = 'ws://' + base.hostname + ':' + port + '/logs/stream';
+
+  let clientClosed = false;
+  const upstreamAbort = () => {
+    if (clientClosed) return;
+    try { ws.close(1001); } catch { /* noop */ }
+  };
+  if (signal) {
+    if (signal.aborted) upstreamAbort();
+    else signal.addEventListener?.('abort', upstreamAbort);
+  }
+  // When the browser drops the SSE, close the upstream WebSocket cleanly.
+  res.on('close', () => {
+    clientClosed = true;
+    if (signal) signal.removeEventListener?.('abort', upstreamAbort);
+    try { ws.close(1001); } catch { /* noop */ }
+  });
+
+  const ws = new WebSocket(wsUrl);
+  const decode = (data: ArrayBuffer | Buffer | string): string => {
+    if (typeof data === 'string') return data;
+    if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+    return (data as Buffer).toString('utf8');
+  };
+
+  ws.addEventListener('open', () => {
+    if (clientClosed) return;
+    try {
+      ws.send(JSON.stringify({ type: 'logs.subscribe', after_seq: null, ...(key !== undefined ? { key } : {}) }));
+    } catch {
+      writeSse(res, 'error', 'failed to subscribe to the log stream');
+      res.end();
+      return;
+    }
+    writeSse(res, 'comment', 'connected');
+  });
+
+  ws.addEventListener('message', (event) => {
+    if (clientClosed) return;
+    const raw = decode(event.data);
+    try {
+      JSON.parse(raw);
+      writeSse(res, 'data', raw);
+    } catch {
+      writeSse(res, 'data', raw);
+    }
+  });
+
+  ws.addEventListener('close', (event) => {
+    if (clientClosed) return;
+    writeSse(res, 'error', 'log stream closed by Lemonade (code ' + event.code + (event.reason ? ' ' + event.reason : '') + ')');
+    res.end();
+  });
+
+  ws.addEventListener('error', () => {
+    if (clientClosed) return;
+    writeSse(res, 'error', 'log stream error');
+    try { ws.close(1001); } catch { /* noop */ }
+    res.end();
+  });
+}
+
 /**
  * Build the node:http handler mounting the Lemonade-specific API proxy at the
  * /dsh-lemonade/api prefix route (ctx.webServer.register). Never throws out:
@@ -378,18 +661,34 @@ export function createLemonadeApiHandler(
   cfg: LemonadeApiConfig,
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   return async (req, res) => {
+    const url = new URL(req.url ?? '/', 'http://localhost');
+    const rest = url.pathname.startsWith(API_ROUTE) ? url.pathname.slice(API_ROUTE.length) : url.pathname;
+    const segments = rest.split('/').filter((part) => part.length > 0);
+    if (segments.length > MAX_SEGMENTS) {
+      throw new RequestError('request path is too deep (' + segments.length + '/' + MAX_SEGMENTS + ')', 'INVALID_REQUEST', 400);
+    }
+    const op = segments[0] ?? '';
+    const args = segments.slice(1);
+    const method = req.method ?? 'GET';
+    const body =
+      method === 'POST' || method === 'PUT' || method === 'PATCH'
+        ? await readRequestBody(req)
+        : undefined;
+
+    // The log stream is a long-lived SSE relay, not a short wire result: the
+    // proxy owns the WebSocket to Lemonade and re-emits it as SSE to the browser.
+    if (op === 'logsStream') {
+      // IncomingMessage's type carries no request signal; derive one and fire
+      // it when the browser drops the underlying socket.
+      const controller = new AbortController();
+      req.socket?.on?.('close', () => controller.abort());
+      await serveLogsStream(cfg, res, controller.signal);
+      return;
+    }
+
     let result: LemonadeWireResult;
     try {
-      const url = new URL(req.url ?? '/', 'http://localhost');
-      const rest = url.pathname.startsWith(API_ROUTE) ? url.pathname.slice(API_ROUTE.length) : url.pathname;
-      const segments = rest.split('/').filter((part) => part.length > 0);
-      const op = segments[0] ?? '';
-      const args = segments.slice(1);
-      const body =
-        req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH'
-          ? await readRequestBody(req)
-          : undefined;
-      result = await serveLemonadeApi(cfg, req.method ?? 'GET', op, args, url.searchParams, body);
+      result = await serveLemonadeApi(cfg, method, op, args, url.searchParams, body);
     } catch (error) {
       result =
         error instanceof RequestError
