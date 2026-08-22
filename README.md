@@ -69,6 +69,7 @@ Then add an entry to the profile's `cordis.patch.yml` (see
 | `defaultContextWindow` | number | `32768` | Context window used when the server doesn't declare one |
 | `maxTokens` | number | `8192` | Default output cap |
 | `streamIdleTimeoutMs` | number | `300000` | SSE stream idle timeout |
+| `listingTimeoutMs` | number | `5000` | Max time one live model-listing query may take (abort if exceeded) |
 | `retryPolicy` | object | default values | Provider retry policy |
 
 Each entry in `models`: `id` (required), `name`, `description`,
@@ -106,7 +107,8 @@ Lemonade via "Fetch available models" (`llm.discoverModels`).
 
 A **Lemonade** tab (next to Chat/Trajectory) exposes the entry points of the
 Lemonade-specific API (health/liveness, telemetry, models with
-Load/Unload/Delete/Files/Update, controllable downloads, and cloud keys).
+Load/Unload/Delete/Files/Update/Info, LoRA adapter list/load/unload,
+controllable downloads, cloud keys, and a live log stream).
 The browser calls the dsh server on the same origin (`/dsh-lemonade/api/<op>`);
 the host proxy to Lemonade (`src/server-api.ts`) resolves baseURL + key
 (these never leave the host). Key selection is **per endpoint**: regular
@@ -115,6 +117,18 @@ endpoints (`/internal/*`, `/metrics`) with `LEMONADE_ADMIN_API_KEY` (falling
 back to the regular key). The route is registered via
 `ctx.webServer.register({ kind: 'prefix', path: '/dsh-lemonade/api', ... })`
 when the `webServer` service is available.
+
+The model table supports **batch operations**: a select-all checkbox in the
+header and one per row let you mark models, then the **Load selected** /
+**Unload selected** / **Delete selected** buttons dispatch one call per selected
+model through the host proxy and report a `done/total` progress line plus how
+many operations failed. The batch delete prompts in a **confirmation modal**
+(instead of the browser's native `confirm()`) before it runs. A **Logs** pane
+(**Logs button in the tab header**) opens a live stream of the Lemonade server's
+own logs: the browser holds a plain SSE connection to the host proxy, which opens
+a WebSocket *client* to Lemonade's `/logs/stream` (the log port is discovered
+from `GET /v1/health` → `websocket_port`, which shares the Realtime Audio port)
+and re-emits every upstream log message as an SSE event.
 
 ### Client browser bundle
 
