@@ -1,7 +1,7 @@
 {
   "name": "@cyrilmarin/dsh-lemonade",
   "description": "Lemonade Server (OpenAI-compatible) LLM provider plugin for the DeepSeek Harness",
-  "version": "0.2.6",
+  "version": "0.4.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -34,7 +34,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node test/adapter.test.mjs && node test/server-api.test.mjs && node test/client-bundle.test.mjs lib/client.js",
+    "test": "node test/adapter.test.mjs && node test/server-api.test.mjs && node test/json-parse.test.mjs && node test/translate.test.mjs && node test/client-bundle.test.mjs lib/client.js",
     "release": "node scripts/release.mjs",
     "release:dry": "node scripts/release.mjs --dry-run",
     "release:major": "node scripts/release.mjs --bump major",
